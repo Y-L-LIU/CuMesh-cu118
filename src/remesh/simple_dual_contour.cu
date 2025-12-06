@@ -10,7 +10,8 @@
 
 template<typename T>
 __device__ __forceinline__ float get_vertex_val(
-    const T* __restrict__ hashmap_vert,
+    const T* __restrict__ hashmap_keys,
+    const uint32_t* __restrict__ hashmap_vals,
     const float* __restrict__ udf,
     const size_t N_vert,
     int x, int y, int z,
@@ -18,19 +19,20 @@ __device__ __forceinline__ float get_vertex_val(
 ) {
     size_t flat_idx = (size_t)x * H * D + (size_t)y * D + z;
     T key = static_cast<T>(flat_idx);
-    T idx = linear_probing_lookup(hashmap_vert, key, N_vert);
+    uint32_t idx = linear_probing_lookup(hashmap_keys, hashmap_vals, key, N_vert);
     return udf[idx];
 }
 
 
 template<typename T>
-__global__ void simple_dual_contour_kernel(
+static __global__ void simple_dual_contour_kernel(
     const size_t N_vert,
     const size_t M,
     const int W,
     const int H,
     const int D,
-    const T* __restrict__ hashmap_vert,
+    const T* __restrict__ hashmap_keys,
+    const uint32_t* __restrict__ hashmap_vals,
     const int32_t* __restrict__ coords,
     const float* __restrict__ udf,
     float* __restrict__ out_vertices,
@@ -52,8 +54,8 @@ __global__ void simple_dual_contour_kernel(
     for (int u = 0; u <= 1; ++u) {
         #pragma unroll
         for (int v = 0; v <= 1; ++v) {
-            float val1 = get_vertex_val(hashmap_vert, udf, N_vert, vx, vy + u, vz + v, W, H, D);
-            float val2 = get_vertex_val(hashmap_vert, udf, N_vert, vx + 1, vy + u, vz + v, W, H, D);
+            float val1 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx, vy + u, vz + v, W, H, D);
+            float val2 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx + 1, vy + u, vz + v, W, H, D);
 
             // Calculate the intersection point
             if ((val1 < 0 && val2 >= 0) || (val1 >= 0 && val2 < 0)) {
@@ -84,8 +86,8 @@ __global__ void simple_dual_contour_kernel(
     for (int u = 0; u <= 1; ++u) {
         #pragma unroll
         for (int v = 0; v <= 1; ++v) {
-            float val1 = get_vertex_val(hashmap_vert, udf, N_vert, vx + u, vy, vz + v, W, H, D);
-            float val2 = get_vertex_val(hashmap_vert, udf, N_vert, vx + u, vy + 1, vz + v, W, H, D);
+            float val1 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx + u, vy, vz + v, W, H, D);
+            float val2 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx + u, vy + 1, vz + v, W, H, D);
 
             if ((val1 < 0 && val2 >= 0) || (val1 >= 0 && val2 < 0)) {
                 float t = -val1 / (val2 - val1);
@@ -114,8 +116,8 @@ __global__ void simple_dual_contour_kernel(
     for (int u = 0; u <= 1; ++u) {
         #pragma unroll
         for (int v = 0; v <= 1; ++v) {
-            float val1 = get_vertex_val(hashmap_vert, udf, N_vert, vx + u, vy + v, vz, W, H, D);
-            float val2 = get_vertex_val(hashmap_vert, udf, N_vert, vx + u, vy + v, vz + 1, W, H, D);
+            float val1 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx + u, vy + v, vz, W, H, D);
+            float val2 = get_vertex_val(hashmap_keys, hashmap_vals, udf, N_vert, vx + u, vy + v, vz + 1, W, H, D);
 
             if ((val1 < 0 && val2 >= 0) || (val1 >= 0 && val2 < 0)) {
                 float t = -val1 / (val2 - val1);
@@ -157,7 +159,8 @@ __global__ void simple_dual_contour_kernel(
  * Isosurfacing a volume defined on vertices of a sparse voxel grid using a simple dual contouring algorithm.
  * Dual vertices are computed by mean of edge intersections.
  * 
- * @param hashmap_vert  [2Nvert] uint32/uint64 hashmap of the vertices
+ * @param hashmap_keys  [Nvert] uint32/uint64 hashmap of the vertices keys
+ * @param hashmap_vals  [Nvert] uint32 tensor containing the hashmap values as vertex indices
  * @param coords        [Mvox, 3] int32 tensor containing the coordinates of the active voxels
  * @param udf           [Mvert] float tensor containing the UDF/SDF values at the vertices
  * @param W             the number of width dimensions
@@ -165,10 +168,11 @@ __global__ void simple_dual_contour_kernel(
  * @param D             the number of depth dimensions
  *
  * @return              [L, 3] float tensor containing the active vertices (Dual Vertices)
-                        [L, 3] int32 tensor containing the intersected edges (1: intersected positive, -1: intersected negative, 0: not intersected)
+                        [L, 3] int32 tensor containing the intersected edges (1: intersected, 0: not intersected)
  */
 std::tuple<torch::Tensor, torch::Tensor> cumesh::simple_dual_contour(
-    const torch::Tensor& hashmap_vert,
+    const torch::Tensor& hashmap_keys,
+    const torch::Tensor& hashmap_vals,
     const torch::Tensor& coords,
     const torch::Tensor& udf,
     int W,
@@ -176,7 +180,7 @@ std::tuple<torch::Tensor, torch::Tensor> cumesh::simple_dual_contour(
     int D
 ) {
     const size_t M = coords.size(0);
-    const size_t N_vert = hashmap_vert.size(0) / 2;
+    const size_t N_vert = hashmap_keys.size(0);
 
     auto vertices = torch::empty({(long)M, 3}, torch::dtype(torch::kFloat32).device(coords.device()));
     auto intersected = torch::empty({(long)M, 3}, torch::dtype(torch::kInt32).device(coords.device()));
@@ -184,24 +188,26 @@ std::tuple<torch::Tensor, torch::Tensor> cumesh::simple_dual_contour(
     dim3 threads(BLOCK_SIZE);
     dim3 blocks((M + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    if (hashmap_vert.dtype() == torch::kUInt32) {
+    if (hashmap_keys.dtype() == torch::kUInt32) {
         simple_dual_contour_kernel<<<blocks, threads>>>(
             N_vert,
             M,
             W, H, D,
-            hashmap_vert.data_ptr<uint32_t>(),
+            hashmap_keys.data_ptr<uint32_t>(),
+            hashmap_vals.data_ptr<uint32_t>(),
             coords.data_ptr<int32_t>(),
             udf.data_ptr<float>(),
             vertices.data_ptr<float>(),
             intersected.data_ptr<int32_t>()
         );
     } 
-    else if (hashmap_vert.dtype() == torch::kUInt64) {
+    else if (hashmap_keys.dtype() == torch::kUInt64) {
         simple_dual_contour_kernel<<<blocks, threads>>>(
             N_vert,
             M,
             W, H, D,
-            hashmap_vert.data_ptr<uint64_t>(),
+            hashmap_keys.data_ptr<uint64_t>(),
+            hashmap_vals.data_ptr<uint32_t>(),
             coords.data_ptr<int32_t>(),
             udf.data_ptr<float>(),
             vertices.data_ptr<float>(),

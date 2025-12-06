@@ -5,6 +5,22 @@ from . import _C
 from .bvh import cuBVH
 
 
+def _init_hashmap(resolution, capacity, device):
+    VOL = resolution * resolution * resolution
+        
+    # If the number of elements in the tensor is less than 2^32, use uint32 as the hashmap type, otherwise use uint64.
+    if VOL < 2**32:
+        hashmap_keys = torch.full((capacity,), torch.iinfo(torch.uint32).max, dtype=torch.uint32, device=device)
+    elif VOL < 2**64:
+        hashmap_keys = torch.full((capacity,), torch.iinfo(torch.uint64).max, dtype=torch.uint64, device=device)
+    else:
+        raise ValueError(f"The spatial size is too large to fit in a hashmap. Get volumn {VOL} > 2^64.")
+
+    hashmap_vals = torch.empty((capacity,), dtype=torch.uint32, device=device)
+    
+    return hashmap_keys, hashmap_vals
+
+
 def remesh_narrow_band_dc(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -130,18 +146,15 @@ def remesh_narrow_band_dc(
     Nvox = coords.shape[0]
     
     # 4.1 Insert Active Voxels into Hashmap
-    # Capacity: 2 * Nvox (load factor 0.5) * 2 (key+val) = 4 * Nvox entries? 
-    # The C++ implementation uses linear probing with simple mod, suggesting 2*Capacity size.
-    # We use a safe upper bound for capacity.
-    hashmap_vox = torch.full((2 * int(2 * Nvox),), 0xffffffff, dtype=torch.uint32, device=device)
+    hashmap_vox = _init_hashmap(resolution, 2 * Nvox, device)
     # coords are (x,y,z), we need to insert them. 
     # The kernel expects 3D coords and stores `thread_id` as value.
-    _C.hashmap_insert_3d_idx_as_val_cuda(hashmap_vox, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1), resolution, resolution, resolution)
+    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vox, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=1), resolution, resolution, resolution)
     
     # 4.2 Get All Active Vertices (Corners of Active Voxels)
     # This C++ function dedups vertices shared by voxels
     coords = coords.contiguous()
-    grid_verts = _C.get_sparse_voxel_grid_active_vertices(hashmap_vox, coords, resolution, resolution, resolution)
+    grid_verts = _C.get_sparse_voxel_grid_active_vertices(*hashmap_vox, coords, resolution, resolution, resolution)
     Nvert = grid_verts.shape[0]
 
     # 4.3 Compute Values (SDF/UDF) at Grid Vertices
@@ -161,14 +174,14 @@ def remesh_narrow_band_dc(
         print("Running Dual Contouring...")
         
     # Insert Grid Vertices into a new hashmap so DC kernel can look up values by coord
-    hashmap_vert = torch.full((2 * int(2 * Nvert),), 0xffffffff, dtype=torch.uint32, device=device)
+    hashmap_vert = _init_hashmap(resolution + 1, 2 * Nvert, device)
     # The hashmap maps (x,y,z) -> index in grid_verts/distances_vert
-    _C.hashmap_insert_3d_idx_as_val_cuda(hashmap_vert, torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1), resolution + 1, resolution + 1, resolution + 1)
+    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap_vert, torch.cat([torch.zeros_like(grid_verts[:, :1]), grid_verts], dim=1), resolution + 1, resolution + 1, resolution + 1)
     
     # Compute dual vertices positions (Relaxation / Mean of intersections) and intersections
     # Returns (Nvox, 3) float tensor and (Nvox, 3) int tensor
     dual_verts, intersected = _C.simple_dual_contour(
-        hashmap_vert, coords, distances_vert, resolution + 1, resolution + 1, resolution + 1
+        *hashmap_vert, coords, distances_vert, resolution + 1, resolution + 1, resolution + 1
     )
     
     # -------------------------------------------------------------------------
@@ -183,7 +196,7 @@ def remesh_narrow_band_dc(
         torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
         connected_voxel.reshape(-1, 3)
     ], dim=1)
-    connected_voxel_indices = _C.hashmap_lookup_3d_cuda(hashmap_vox, connected_voxel_hash_key, resolution, resolution, resolution).reshape(M, 4).int()
+    connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap_vox, connected_voxel_hash_key, resolution, resolution, resolution).reshape(M, 4).int()
     connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
     quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
     intersected_dir = intersected[connected_voxel_valid].int()
